@@ -11,7 +11,7 @@ A Python script that demonstrates network namespace isolation and TUN device man
 - Sets up a TUN virtual network interface to handle ICMP (ping) traffic
 - Implements a basic IPv4 pseudo-gateway that responds to ICMP Echo Requests with Echo Replies
 
-> **:warning::**
+> **:warning:WARNING**
 >
 > On Ubuntu 23.04+ the following Kernel parameters are required (or the script has to be run as root):
 >
