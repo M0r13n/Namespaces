@@ -75,6 +75,8 @@ def re_exec_in_namespace():
 def create_network_namespace():
     # This only works for root. This is why re_exec_in_namespace has to be called ealier
     print('Cloning into new network namespace...')
+    print('You may enter this namespace:')
+    print(f'  > sudo nsenter --target {os.getpid()} --net /bin/bash')
     os.unshare(os.CLONE_NEWNET)
 
 
