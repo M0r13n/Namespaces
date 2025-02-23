@@ -205,7 +205,7 @@ def configure_tun_device(tun_name, ip_address, subnet_mask):
     print('Configuring done.')
 
 
-def create_dns_query(domain="www.google.com"):
+def create_dns_query(domain):
     """Create a simple DNS query packet."""
     # DNS Header
     transaction_id = os.urandom(2)  # Random transaction ID
@@ -233,8 +233,8 @@ def create_dns_query(domain="www.google.com"):
     return packet
 
 
-def start_pinging(host: str, port: str):
-    """Send DNS queries to Google's public DNS server."""
+def start_digging(host: str, port: str):
+    """Send DNS queries"""
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(2)
@@ -247,7 +247,7 @@ def start_pinging(host: str, port: str):
                 sock.sendto(query, (host, port))
 
                 response, addr = sock.recvfrom(1024)
-                print(f"[CHILD]: Received DNS response from {addr[0]}, length: {len(response)} bytes")
+                print(f"[CHILD]: Received DNS response(s) from {addr[0]}, length: {len(response)} bytes")
 
             except socket.timeout:
                 print("[CHILD]: DNS query timeout")
@@ -257,10 +257,11 @@ def start_pinging(host: str, port: str):
             time.sleep(1)
 
 
-def handle_packet(data):
+def get_udp_packet_info(data: bytes) -> tuple[str, str, int, int, bytes] | None:
     try:
         ip_header = IPv4Header.from_bytes(data)
     except ValueError:
+        # be gentle and ignore errors
         return None
 
     if len(data) < 28:  # Minimum length for IP + UDP headers
@@ -272,12 +273,12 @@ def handle_packet(data):
 
     # Extract UDP header and payload
     udp_data = data[ip_header_length:]
-    src_port, dst_port, length, _ = struct.unpack('!HHHH', udp_data[:8])
+    src_port, dst_port, _, _ = struct.unpack('!HHHH', udp_data[:8])
     payload = udp_data[8:]
 
     print(f'[PARENT]: Forwarding UDP packet from {ip_header.source_ip}:{src_port} to {ip_header.dest_ip}:{dst_port}')
 
-    return (ip_header.dest_ip, src_port, dst_port, payload)
+    return (ip_header.source_ip, ip_header.dest_ip, src_port, dst_port, payload)
 
 
 def act_as_gateway(tun_fd, child_read, child_write):
@@ -318,13 +319,14 @@ def calculate_udp_checksum(src_ip: str, dst_ip: str, udp_packet: bytes) -> int:
     protocol = 17  # UDP protocol number 【1】
     udp_length = len(udp_packet)
 
-    pseudo_header = struct.pack('!4s4sBBH',
-                                src_addr,
-                                dst_addr,
-                                zero,
-                                protocol,
-                                udp_length
-                                )
+    pseudo_header = struct.pack(
+        '!4s4sBBH',
+        src_addr,
+        dst_addr,
+        zero,
+        protocol,
+        udp_length
+    )
 
     # Calculate checksum over pseudo-header + udp packet
     checksum = calculate_checksum(pseudo_header + udp_packet)
@@ -336,20 +338,21 @@ def make_udp_header(payload: bytes, src_port: int, dst_port: int) -> bytes:
     length = 8 + len(payload)  # 8 bytes for header + payload length 【1】
 
     # Create initial header with zero checksum
-    header = struct.pack('!HHHH',
-                         src_port,
-                         dst_port,
-                         length,
-                         0  # Initial checksum of 0
-                         )
+    header = struct.pack(
+        '!HHHH',
+        src_port,
+        dst_port,
+        length,
+        0  # Initial checksum of 0
+    )
 
     return header
 
 
-def make_response(payload: bytes, src_ip: str, src_port, dst_port, dst_ip: str = "192.168.1.1") -> bytes:
+def make_response(payload: bytes, src_ip: str, src_port, dst_ip: str, dst_port,) -> bytes:
     """Create a complete packet with IP header and payload."""
 
-    # Create UDP header with swapped ports
+    # Create UDP header
     udp_header = make_udp_header(payload, src_port, dst_port)
 
     # Combine UDP header and payload
@@ -384,24 +387,31 @@ def main():
             os.close(parent_to_child_read)
             os.close(child_to_parent_write)
 
+            # The original process still has access to the original network namespace.
+            # Thus, it can create a regular socket to forward all packets.
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(2)
 
             while True:
+                # Let the parent wait for packets coming from the TUN device
                 data = os.read(child_to_parent_read, 1024)
-                packet_info = handle_packet(data)
+
+                # Only consider UDP packets
+                packet_info = get_udp_packet_info(data)
                 if packet_info:
-                    dst_ip, src_port, dst_port, payload = packet_info
+                    src_ip, dst_ip, src_port, dst_port, payload = packet_info
                     try:
-                        # Forward the UDP payload
+                        # Forward the UDP payload to its destination
                         sock.sendto(payload, (dst_ip, dst_port))
 
-                        # Wait for response
+                        # Wait for a response
                         response, addr = sock.recvfrom(1024)
                         if response:
                             print(f'[PARENT] Received response from {addr}.')
-                            foo = make_response(response, dst_ip, dst_port, src_port)
-                            os.write(parent_to_child_write, foo)
+
+                            # Forward the response into the TUN devices
+                            response = make_response(response, dst_ip, dst_port, src_ip, src_port)
+                            os.write(parent_to_child_write, response)
                     except socket.timeout:
                         print("[PARENT]: No response received")
                     except Exception as e:
@@ -422,8 +432,8 @@ def main():
             print('Parent is acting as gateway.')
             act_as_gateway(tun_fd, parent_to_child_read, child_to_parent_write)
         else:
-            print('Child starts UDP pinging.')
-            start_pinging('10.0.0.240', 53)
+            print('Child starts digging...')
+            start_digging('10.0.0.240', 53)
 
 
 if __name__ == "__main__":
