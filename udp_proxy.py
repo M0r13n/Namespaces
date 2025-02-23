@@ -3,7 +3,8 @@
 # sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 # unshare --user --map-user=0
 
-import json
+import ipaddress
+from enum import IntEnum
 import fcntl
 import getpass
 import os
@@ -14,7 +15,6 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from scipy.fft import dst
 
 TUNSETIFF = 0x400454ca      # TUN/TAP device ioctl code
 IFF_TUN = 0x0001            # TUN device (no Ethernet headers)
@@ -23,23 +23,81 @@ TUN_GW_IP = '192.168.1.1'   # The IP address of the TUN "gateway"
 TUN_NET_MASK = '24'         # The subnet mask of the virtual TUN network
 
 
+class IPProtocol(IntEnum):
+    """Common IP protocols"""
+    ICMP = 1
+    TCP = 6
+    UDP = 17
+
+    UNKNOWN = 0
+
+    @classmethod
+    def _missing_(cls, value):
+        """Return TCP as default when an invalid protocol number is provided"""
+        return cls.UNKNOWN
+
+
+class IPFlags(IntEnum):
+    """IP fragmentation flags"""
+    NONE = 0
+    DONT_FRAGMENT = 2
+    MORE_FRAGMENTS = 1
+
+
 @dataclass
 class IPv4Header:
-    version: int
-    ihl: int
-    tos: int
-    total_length: int
-    identification: int
-    flags: int
-    fragment_offset: int
-    ttl: int
-    protocol: int
-    header_checksum: int
-    source_ip: str
-    dest_ip: str
+    """
+    IPv4 Header implementation following RFC 791.
+
+    All integer fields are in network byte order (big-endian).
+    """
+    version: int = 4  # Default to IPv4
+    ihl: int = 5      # Default to minimum length (20 bytes)
+    tos: int = 0
+    total_length: int = 20  # Default to header-only length
+    identification: int = 0
+    flags: IPFlags = IPFlags.NONE
+    fragment_offset: int = 0
+    ttl: int = 64    # Default TTL
+    protocol: IPProtocol = IPProtocol.TCP
+    header_checksum: int = 0
+    source_ip: str = "0.0.0.0"
+    dest_ip: str = "0.0.0.0"
+
+    def __post_init__(self):
+        """Validate header fields after initialization"""
+        if not 4 <= self.version <= 15:
+            raise ValueError("Version must be between 4 and 15")
+        if not 5 <= self.ihl <= 15:
+            raise ValueError(f"IHL must be between 5 and 15 but is {self.ihl}")
+        if not 0 <= self.tos <= 255:
+            raise ValueError("TOS must be between 0 and 255")
+        if not 20 <= self.total_length <= 65535:
+            raise ValueError("Total length must be between 20 and 65535")
+        if not 0 <= self.identification <= 65535:
+            raise ValueError("Identification must be between 0 and 65535")
+        if not 0 <= self.fragment_offset <= 8191:
+            raise ValueError("Fragment offset must be between 0 and 8191")
+        if not 0 <= self.ttl <= 255:
+            raise ValueError("TTL must be between 0 and 255")
+
+        # Validate IP addresses
+        try:
+            ipaddress.IPv4Address(self.source_ip)
+            ipaddress.IPv4Address(self.dest_ip)
+        except ipaddress.AddressValueError as e:
+            raise ValueError(f"Invalid IP address: {e}")
+
+    @property
+    def header_length(self) -> int:
+        """Return header length in bytes"""
+        return self.ihl * 4
 
     @classmethod
     def from_bytes(cls, data: bytes) -> 'IPv4Header':
+        if len(data) < 20:
+            raise ValueError("IPv4 header must be at least 20 bytes")
+
         ip_header = struct.unpack('!BBHHHBBH4s4s', data[:20])
         return cls(
             version=ip_header[0] >> 4,
@@ -47,13 +105,58 @@ class IPv4Header:
             tos=ip_header[1],
             total_length=ip_header[2],
             identification=ip_header[3],
-            flags=ip_header[4] >> 13,
+            flags=IPFlags(ip_header[4] >> 13),
             fragment_offset=ip_header[4] & 0x1FFF,
             ttl=ip_header[5],
-            protocol=ip_header[6],
+            protocol=IPProtocol(ip_header[6]),
             header_checksum=ip_header[7],
             source_ip=socket.inet_ntoa(ip_header[8]),
             dest_ip=socket.inet_ntoa(ip_header[9])
+        )
+
+    def to_bytes(self) -> bytes:
+        dummy_header = struct.pack(
+            '!BBHHHBBH4s4s',
+            (self.version << 4) | (self.ihl & 0xF),
+            self.tos,
+            self.total_length,
+            self.identification,
+            (self.flags << 13) | (self.fragment_offset & 0x1FFF),
+            self.ttl,
+            self.protocol,
+            0,  # Temporary checksum
+            socket.inet_aton(self.source_ip),
+            socket.inet_aton(self.dest_ip),
+        )
+        checksum = self._calculate_checksum(dummy_header)
+        return dummy_header[:10] + struct.pack('!H', checksum) + dummy_header[12:20]
+
+    @staticmethod
+    def _calculate_checksum(data: bytes) -> int:
+        if len(data) % 2 == 1:
+            data += b'\0'
+
+        words = struct.unpack('!%dH' % (len(data) // 2), data)
+        checksum = sum(words)
+
+        while checksum >> 16:
+            checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+        return ~checksum & 0xFFFF
+
+    def is_fragment(self) -> bool:
+        """Return True if packet is a fragment"""
+        return bool(self.flags & IPFlags.MORE_FRAGMENTS or self.fragment_offset > 0)
+
+    def __str__(self) -> str:
+        """Return human-readable string representation"""
+        return (
+            f"IPv{self.version} Header:\n"
+            f"  Length: {self.header_length} bytes\n"
+            f"  Protocol: {self.protocol.name}\n"
+            f"  TTL: {self.ttl}\n"
+            f"  Source: {self.source_ip}\n"
+            f"  Destination: {self.dest_ip}"
         )
 
 
@@ -125,8 +228,7 @@ def create_dns_query(domain="www.google.com"):
     qclass = b'\x00\x01'  # IN class
 
     # Combine all parts
-    packet = (transaction_id + flags + questions + answers +
-              authority + additional + question + qtype + qclass)
+    packet = (transaction_id + flags + questions + answers + authority + additional + question + qtype + qclass)
 
     return packet
 
@@ -156,7 +258,10 @@ def start_pinging(host: str, port: str):
 
 
 def handle_packet(data):
-    ip_header = IPv4Header.from_bytes(data)
+    try:
+        ip_header = IPv4Header.from_bytes(data)
+    except ValueError:
+        return None
 
     if len(data) < 28:  # Minimum length for IP + UDP headers
         return None
@@ -185,7 +290,6 @@ def act_as_gateway(tun_fd, child_read, child_write):
                 os.write(child_write, data)
         else:
             response = os.read(child_read, 2048)
-            print(IPv4Header.from_bytes(response))
             os.write(tun_fd, response)
 
 
@@ -203,42 +307,6 @@ def calculate_checksum(data):
         high = checksum >> 16
 
     return ~checksum & 0xFFFF
-
-
-def make_ip_header(src_ip: str, dst_ip: str, payload_length: int) -> bytes:
-    """Create an IP header with given parameters."""
-    version_ihl = 0x45  # IPv4, 5 words (20 bytes)
-    tos = 0
-    total_length = 20 + payload_length  # IP header (20) + payload length
-    identification = int.from_bytes(os.urandom(2), 'big')
-    flags_fragment = 0x4000  # Don't fragment
-    ttl = 64
-    protocol = 17  # UDP
-    checksum = 0
-
-    # Convert IPs to bytes
-    src_ip_bytes = socket.inet_aton(src_ip)
-    dst_ip_bytes = socket.inet_aton(dst_ip)
-
-    # Pack IP header
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-                            version_ihl,
-                            tos,
-                            total_length,
-                            identification,
-                            flags_fragment,
-                            ttl,
-                            protocol,
-                            checksum,
-                            src_ip_bytes,
-                            dst_ip_bytes
-                            )
-
-    # Calculate and set checksum
-    checksum = calculate_checksum(ip_header)
-    ip_header = ip_header[:10] + struct.pack('!H', checksum) + ip_header[12:]
-
-    return ip_header
 
 
 def calculate_udp_checksum(src_ip: str, dst_ip: str, udp_packet: bytes) -> int:
@@ -292,7 +360,13 @@ def make_response(payload: bytes, src_ip: str, src_port, dst_port, dst_ip: str =
     udp_packet = udp_packet[:6] + struct.pack('!H', checksum) + udp_packet[8:]
 
     # Create IP header
-    ip_header = make_ip_header(src_ip, dst_ip, len(udp_packet))
+    ip_header = IPv4Header(
+        source_ip=src_ip,
+        dest_ip=dst_ip,
+        ttl=5,
+        total_length=20 + len(udp_packet),
+        protocol=IPProtocol.UDP
+    ).to_bytes()
 
     # Combine headers and payload
     return ip_header + udp_packet
@@ -325,6 +399,7 @@ def main():
                         # Wait for response
                         response, addr = sock.recvfrom(1024)
                         if response:
+                            print(f'[PARENT] Received response from {addr}.')
                             foo = make_response(response, dst_ip, dst_port, src_port)
                             os.write(parent_to_child_write, foo)
                     except socket.timeout:
